@@ -3,7 +3,7 @@
 Scikit-learn compatible IV/WOE binning, feature selection, and PSI auditing for credit risk modeling.
 
 [![PyPI version](https://img.shields.io/pypi/v/iv-woe-filter?style=flat-square&cacheSeconds=60)](https://pypi.org/project/iv-woe-filter/)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/dilshodazamjonov/iv-woe-filter/ci.yaml?style=flat-square&label=CI)](https://github.com/dilshodazamjonov/iv-woe-filter/actions)
 [![scikit-learn compatible](https://img.shields.io/badge/sklearn-compatible-orange?style=flat-square)](https://scikit-learn.org/)
@@ -12,7 +12,7 @@ Scikit-learn compatible IV/WOE binning, feature selection, and PSI auditing for 
 
 ## Motivation
 
-In credit risk modeling, WOE encoding and IV-based feature selection are standard practice. In most teams, they are also a source of recurring problems: hand-rolled binning scripts that differ between analysts, WOE maps that are never persisted, transformations applied inconsistently between training and scoring, and no formal record of how features were selected or why.
+In credit risk modeling, WOE(Weight of Evidence) encoding and IV(Information Value)-based feature selection are standard practice. In most teams, they are also a source of recurring problems: hand-rolled binning scripts that differ between analysts, WOE maps that are never persisted, transformations applied inconsistently between training and scoring, and no formal record of how features were selected or why.
 
 The consequences are familiar - model validation findings, scorecard drift, leakage that surfaces only in production, cycles that require reconstructing preprocessing decisions from memory or scattered notebooks.
 
@@ -66,50 +66,107 @@ pip install iv-woe-filter   # iv-woe-filter is not on conda-forge; install via p
 ### Usage Example
 
 ```python
+import numpy as np
 import pandas as pd
 from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+
 from iv_woe_filter import IVWOEFilter
 
 # 1. Generate synthetic data
-X_arr, y = make_classification(
-    n_samples=5000,
-    n_features=10,
-    n_informative=6,
-    random_state=42
-)
+X_arr, y = make_classification(n_samples=5000, n_features=10, n_informative=6, random_state=42)
 X = pd.DataFrame(X_arr, columns=[
     "bureau_score", "months_employed", "loan_to_value", "num_delinquencies",
     "credit_utilisation", "income_band", "months_since_last_default",
     "debt_to_income", "num_inquiries", "age_at_app",
 ])
 
-# 2. Fit the filter (train phase)
-filter_ = IVWOEFilter(
-    binning_method="tree",
-    n_bins=6,
-    min_iv=0.02,
-    min_gini=0.05,
-    tree_max_depth=3,
-    tree_min_samples_leaf=0.05,
-    random_state=42,
-    drop_unselected=True,
-    output_dir="audit/",
+# 2. Declare special/sentinel values that should be isolated during binning
+special_codes = {
+    "bureau_score": [-999],
+    "months_employed": [9999],
+    "num_delinquencies": [-1],
+}
+
+# 3. Simulate special values and true missing values before the split
+X.loc[X.index[:75], "bureau_score"] = -999
+X.loc[X.index[75:125], "months_employed"] = 9999
+X.loc[X.index[125:175], "num_delinquencies"] = -1
+
+X.loc[X.index[175:250], "loan_to_value"] = np.nan
+X.loc[X.index[250:325], "credit_utilisation"] = np.nan
+X.loc[X.index[325:375], "income_band"] = np.nan
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+# 4. Add a few more null/special cases to the holdout sample
+X_test = X_test.copy()
+X_test.loc[X_test.index[:15], "bureau_score"] = -999
+X_test.loc[X_test.index[15:30], "months_employed"] = 9999
+X_test.loc[X_test.index[30:45], "loan_to_value"] = np.nan
+
+print("Training data simulation summary:")
+print(X_train.isna().sum()[lambda s: s.gt(0)])
+print(
+    {
+        feature: int(X_train[feature].isin(values).sum())
+        for feature, values in special_codes.items()
+    }
 )
-X_woe = filter_.fit_transform(X, y)
 
-print(filter_.iv_table_)          # IV and Gini scores for all features
-print(filter_.selected_features_)  # Features that passed both IV and Gini thresholds
+binning_runs = (
+    ("quantile", {}),
+    ("chi_merge", {}),
+    ("tree", {"tree_max_depth": 3, "tree_min_samples_leaf": 0.05}),
+)
 
-# 3. Simulate a population shift (out-of-time phase)
-X_test = X.copy()
-X_test["age_at_app"] += 2.0
+for binning_method, extra_kwargs in binning_runs:
+    print(f"\n=== {binning_method.upper()} BINNING ===")
 
-# 4. Audit feature stability (PSI)
-psi_report = filter_.calculate_psi(X_test, save=True)
-print(psi_report)                 # PSI score and shift status
+    pipe = Pipeline([
+        (
+            "woe",
+            IVWOEFilter(
+                binning_method=binning_method,
+                n_bins=6,
+                min_iv=0.02,
+                min_gini=0.05,
+                special_codes=special_codes,
+                drop_unselected=False,
+                output_dir=f"audit/{binning_method}/",
+                random_state=42,
+                verbose=False,
+                **extra_kwargs,
+            ),
+        ),
+        ("model", LogisticRegression(max_iter=1000)),
+    ])
+
+    pipe.fit(X_train, y_train)
+
+    woe_step = pipe.named_steps["woe"]
+    iv_results = woe_step.iv_table_
+    psi_results = woe_step.calculate_psi(X_test)
+
+    print(iv_results)
+    print("Selected features:", woe_step.selected_features_)
+    print(psi_results)
+
+    plot_paths = woe_step.save_feature_plot(
+        output_dir=f"audit/{binning_method}/plots",
+        feature="bureau_score",
+        round_digits=2,
+    )
+    print("Saved plots:", plot_paths)
+
+    predictions = pipe.predict_proba(X_test)
+    print("AUC:", roc_auc_score(y_test.flatten(), predictions[:, 1]))
 ```
 
-For the default unsupervised path, omit `binning_method` and the tree-specific parameters. `IVWOEFilter()` uses quantile binning for numeric features unless you explicitly switch to `binning_method="tree"`.
+For the default unsupervised path, omit `binning_method` and the tree-specific parameters. `IVWOEFilter()` uses quantile binning for numeric features unless you explicitly switch to a supervised alternative such as `binning_method="chi_merge"` or `binning_method="tree"`.
 
 ### Pipeline Usage
 
@@ -154,16 +211,16 @@ pipe.fit(X_train, y_train)
 | Capability | Description |
 |---|---|
 | IV-based feature filtering | Features that fall below a configurable IV threshold are excluded at transform time. The threshold and all IV scores are recorded. |
-| Gini-based rank-ordering validation | Gini is derived from ROC-AUC using `2 * max(AUC, 1 - AUC) - 1` and used as a secondary selection criterion alongside IV. Features below the `min_gini` threshold are excluded, ensuring retained features demonstrate meaningful predictive separation. |
+| Gini-based rank-ordering validation | Gini is derived from ROC-AUC using `2 * max(AUC, 1 - AUC) - 1` and is computed on the fitted WOE representation for every feature. Features below the `min_gini` threshold are excluded, ensuring the retained encoded features demonstrate meaningful predictive separation. |
 | WOE encoding | Raw feature values are replaced with Weight of Evidence scores derived from the training distribution. Encoding is applied consistently via the stored WOE map at transform time. |
-| Configurable numeric binning | Numeric features use equal-frequency quantile bins by default, with supervised tree-based bins available through `binning_method="tree"`. |
+| Configurable numeric binning | Numeric features use equal-frequency quantile bins by default, with supervised ChiMerge and tree-based bins available through `binning_method`. |
 | Categorical support | String and low-cardinality integer columns are handled natively; no manual encoding is required before fitting. |
 | Small bin merging | Bins below a configurable population share are merged with their nearest neighbour, eliminating zero-event and statistically unstable bins before WOE computation. |
 | Special codes isolation | Sentinel values (e.g. `-99`, `9999`) are removed from the continuous distribution before binning and assigned dedicated WOE bins, preserving their signal without distorting numeric boundaries. |
 | Target proxy signal flagging | Features with IV above a configurable upper threshold are flagged as potential target proxy signals and recorded in the audit output for modeler review. |
 | Monotonicity auditing | The WOE trend direction is checked across ordered bins for every numeric feature. Non-monotonic features are flagged in the audit output. |
 | Population Stability Index (PSI) | `calculate_psi()` compares training-time bin distributions against a new dataset to detect population drift, producing a per-feature stability report. |
-| Parallel processing | All per-feature operations run in parallel via `joblib`. |
+| Parallel processing | All per-feature operations run in parallel via `joblib`, with backend selection controlled by `parallel_backend`. |
 | Audit artifact generation | Structured CSV files are written at the end of every `fit()` and `calculate_psi()` call, covering IV scores, Gini coefficients, bin-level statistics, per-feature governance diagnostics, and population stability. |
 
 ---
@@ -177,7 +234,7 @@ raw features -> special code isolation -> numeric binning -> small bin merging
 
 ### 1. Binning
 
-When `fit()` is called, each feature is binned independently. Numeric features are assigned to equal-frequency quantile bins by default, ensuring each bin has a comparable share of the training population. If `binning_method="tree"` is selected, numeric boundaries are learned from the binary target using a decision tree constrained by `n_bins` and the optional tree parameters, then passed through the same WOE/IV workflow. Categorical features are binned by value. Before binning, any values listed in `special_codes` for that feature are extracted and assigned their own dedicated bin.
+When `fit()` is called, each feature is binned independently. Numeric features are assigned to equal-frequency quantile bins by default, ensuring each bin has a comparable share of the training population. If `binning_method="chi_merge"` is selected, adjacent ordered value groups are merged using a binary-target chi-square test until the requested bin budget is reached. If `binning_method="tree"` is selected, numeric boundaries are learned from the binary target using a decision tree constrained by `n_bins` and the optional tree parameters, then passed through the same WOE/IV workflow. Categorical features are binned by value. Before binning, any values listed in `special_codes` for that feature are extracted and assigned their own dedicated bin.
 
 Once initial bins are created, any bin whose population share falls below `min_bin_pct` is merged with its nearest neighbour. This step prevents unstable WOE estimates and zero-event bins, both of which introduce noise into IV calculations and can cause calibration issues downstream.
 
@@ -203,13 +260,13 @@ IV = sum_i ((%Goods_i - %Bads_i) * WOE_i)
 
 In plain terms: IV measures how well a feature's bins separate defaults from non-defaults. A higher IV means stronger separation. After fitting, all IV scores are stored in `iv_table_` sorted in descending order.
 
-Gini measures how well the raw feature ranks good versus bad observations, regardless of how it is binned. It is derived from the feature-level ROC-AUC and expressed on a 0-1 scale.
+Gini measures how well the fitted feature representation ranks good versus bad observations. In this package, that representation is the stored WOE mapping applied to the learned bins for both numeric and categorical features. This keeps `min_gini` comparable across feature types and expresses separation in the same transformed space the model will actually consume. It is derived from the feature-level ROC-AUC and expressed on a 0-1 scale.
 
 ```text
 Gini = 2 * max(AUC, 1 - AUC) - 1
 ```
 
-Gini and IV are complementary. IV reflects the aggregate separation signal as captured by the chosen bin structure; Gini evaluates the underlying rank-ordering quality of the raw feature, independent of any binning decisions. Both are recorded in `iv_table_` and `feature_audit.csv`.
+Gini and IV are complementary. IV reflects the aggregate separation signal captured by the chosen bin structure, while Gini evaluates the discriminatory power of the fitted WOE representation. Both are recorded in `iv_table_` and `feature_audit.csv`.
 
 ### 4. Feature Selection
 
@@ -246,9 +303,9 @@ If `output_dir` is set, CSV files are written automatically at the end of `fit()
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `n_bins` | `int` | `10` | Maximum number of bins for numeric features |
-| `binning_method` | `str` | `"quantile"` | Numeric binning strategy. Supported values are `"quantile"` and `"tree"` |
+| `binning_method` | `str` | `"quantile"` | Numeric binning strategy. Supported values are `"quantile"`, `"chi_merge"`, and `"tree"` |
 | `min_iv` | `float` | `0.02` | Minimum IV to retain a feature at transform time |
-| `min_gini` | `float` | `0.05` | Minimum Gini coefficient to retain a feature at transform time |
+| `min_gini` | `float` | `0.05` | Minimum Gini coefficient to retain a feature at transform time, computed on the fitted WOE representation |
 | `max_iv_for_leakage` | `float` | `0.8` | Features with IV above this value are flagged as potential target proxy signals |
 | `min_bin_pct` | `float or None` | `0.05` | Minimum bin population share (0-1); bins below this are merged |
 | `special_codes` | `dict or None` | `{}` | Per-feature lists of sentinel values to isolate before binning |
@@ -261,6 +318,7 @@ If `output_dir` is set, CSV files are written automatically at the end of `fit()
 | `tree_min_samples_leaf` | `int, float, or None` | `None` | Minimum samples per tree leaf. If `None`, `min_bin_pct` is used when available |
 | `tree_min_samples_split` | `int or float` | `2` | Minimum samples required to split an internal tree node |
 | `n_jobs` | `int` | `-1` | Number of parallel workers passed to `joblib` (`-1` = all cores) |
+| `parallel_backend` | `str` | `"auto"` | Joblib backend preference. `"auto"` uses threads for supervised numeric binning and processes otherwise; `"threads"` and `"processes"` force a specific backend |
 | `output_dir` | `str or None` | `None` | Directory for audit CSV artifacts; no files are written if `None` |
 | `verbose` | `bool` | `True` | If `True`, progress is logged via the standard `logging` module |
 
@@ -273,8 +331,8 @@ These attributes are available after calling `fit()`.
 | `iv_table_` | `pd.DataFrame` | IV and Gini scores for all processed features, sorted descending by IV |
 | `selected_features_` | `list[str]` | Features that met both the `min_iv` and `min_gini` thresholds |
 | `woe_maps_` | `dict[str, dict]` | Bin-to-WOE mapping per feature, applied at transform time |
-| `binning_` | `dict[str, Any]` | Fitted bin configuration per feature, including the learned `binning_method` and numeric bin edges or categorical mappings |
-| `monotonicity_report_` | `dict[str, Any]` | Monotonicity check results per feature, including direction |
+| `binning_` | `dict[str, NumericBinConfig \| CategoricalBinConfig]` | Fitted bin configuration per feature, including the learned `binning_method`, numeric bin edges or categorical mappings, and any persisted post-fit merge map |
+| `monotonicity_report_` | `dict[str, MonotonicityResult]` | Monotonicity check results per feature, including `is_monotonic` and `direction` |
 | `leakage_flags_` | `dict[str, bool]` | `True` for each feature whose IV exceeded `max_iv_for_leakage` |
 | `feature_types_` | `dict[str, str]` | `"numeric"` or `"categorical"` per feature |
 | `reference_distributions_` | `dict[str, pd.Series]` | Training-time bin distributions stored per feature; used as the expected baseline when `calculate_psi()` is called |
@@ -291,6 +349,10 @@ audit_outputs/
     bin_stats.csv
     feature_audit.csv
     stability_report.csv
+    plots/
+        bureau_score.png
+        months_employed.png
+        ...
 ```
 
 ### `iv_summary.csv`
@@ -308,6 +370,12 @@ One row per feature. Contains feature type, binning method, IV, Gini, monotonici
 ### `stability_report.csv`
 
 One row per feature. Contains the PSI score computed against the dataset passed to `calculate_psi()`, along with a shift status derived from `psi_thresholds` (`Stable`, `Minor Shift`, or `Significant Shift`). This file is intended for periodic out-of-time monitoring and provides a documented record of population drift assessments across model deployment cycles.
+
+### Feature Plots
+
+`IVWOEFilter` also provides built-in plotting methods through `plot_feature_audit()` and `save_feature_plot()`. Each feature plot uses bin labels on the x-axis, bad-rate bars on the left y-axis, and a WOE line on the right y-axis. Numeric bin ranges are rounded for readability, and each bar is annotated with total count, good count, and bad count so the visual can be used directly in audit discussions.
+
+Use `save_feature_plot(feature="all")` to save every fitted feature, or pass a specific feature name to save just one plot.
 
 ---
 
@@ -330,6 +398,19 @@ IVWOEFilter(
 `n_bins` is passed as the maximum number of tree leaves. If `tree_min_samples_leaf` is not set, `min_bin_pct` is used as the leaf-size guardrail, so very small leaves are discouraged before WOE is calculated.
 
 In practice, `tree` is useful when you want the binning stage to pick target-aware cut points instead of equal-frequency intervals. The tradeoff is that tree-based thresholds are more sample-dependent than quantile bins, so they should be reviewed carefully when stability matters.
+
+### ChiMerge Numeric Binning
+
+For numeric features, `binning_method="chi_merge"` learns ordered bins by repeatedly merging the adjacent pair with the smallest chi-square separation in the binary target. This mode is numeric-only and supervised: it uses the target during fit to find risk-homogeneous intervals, then reuses the learned cut points in the same WOE/IV workflow as the quantile and tree paths.
+
+```python
+IVWOEFilter(
+    binning_method="chi_merge",
+    n_bins=6,
+)
+```
+
+`n_bins` is treated as the maximum number of final numeric intervals. On moderate-cardinality features, ChiMerge starts from one bin per distinct value. On very high-cardinality features, the implementation first compresses the distribution into ordered quantile seed bins before merging, which keeps runtime and memory usage practical on larger datasets. The tradeoff is that its learned thresholds are still sample-dependent and should be reviewed with the same stability discipline as any other supervised binning method.
 
 ### Special Codes Handling
 
@@ -365,6 +446,8 @@ IVWOEFilter(n_jobs=4)    # fixed worker count
 IVWOEFilter(n_jobs=1)    # single-threaded (useful for debugging)
 ```
 
+By default, `parallel_backend="auto"` uses thread-based workers for supervised numeric binning (`chi_merge` and `tree`) and process-based workers otherwise. This keeps the heavier supervised paths more stable on Windows while preserving the default process backend for the simpler quantile path. If you need to force one strategy, pass `parallel_backend="threads"` or `parallel_backend="processes"`.
+
 ### Sklearn Compatibility
 
 `IVWOEFilter` extends `BaseEstimator` and `TransformerMixin` and is fully compatible with the sklearn ecosystem. It can be used as a stage in `Pipeline`, tuned via `GridSearchCV`, and evaluated within `cross_val_score`. `get_feature_names_out()` is implemented for pipeline introspection.
@@ -389,7 +472,7 @@ The following are known constraints of the current implementation. They are docu
 
 **IV is sensitive to binning strategy.** Information Value is not a fixed property of a feature - it depends on how that feature is binned. Different values of `binning_method`, `n_bins`, or `min_bin_pct` will produce different IV scores for the same feature on the same dataset. IV scores should not be compared across fits that used different binning configurations.
 
-**Tree-based thresholds are sample-dependent.** When `binning_method="tree"` is used, learned split points come from the observed relationship between a feature and the target in the fit sample. On smaller or noisier datasets, those thresholds can be less stable than quantile bins and should be reviewed with PSI, monotonicity, and holdout performance in mind.
+**Supervised thresholds are sample-dependent.** When `binning_method="tree"` or `binning_method="chi_merge"` is used, learned split points come from the observed relationship between a feature and the target in the fit sample. On smaller or noisier datasets, those thresholds can be less stable than quantile bins and should be reviewed with PSI, monotonicity, and holdout performance in mind.
 
 **The target proxy signal flag is a heuristic, not a detection mechanism.** `max_iv_for_leakage` identifies features with unusually high IV relative to a configurable threshold. A high IV score is a signal worth investigating, not a confirmation of leakage. Legitimate features can have high IV; some forms of leakage produce moderate IV. The flag is an input to human judgment, not a substitute for it.
 
@@ -450,7 +533,7 @@ iv-woe-filter/
         iv_woe_filter/
             __init__.py
             iv_woe_filter.py     # IVWOEFilter transformer
-            binning.py           # Quantile, tree, and categorical binning logic
+            binning.py           # Quantile, ChiMerge, tree, and categorical binning logic
             woe.py               # Vectorized WOE / IV computation and monotonicity checks
             metrics.py           # Gini and PSI calculations
     tests/
